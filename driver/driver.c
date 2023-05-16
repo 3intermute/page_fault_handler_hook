@@ -26,10 +26,15 @@ module_param_named(pid, hooked_pid, int, 0644);
 static pte_t *hooked_ptep;
 struct vm_area_struct *hooked_vma;
 static struct task_struct *hooked_task;
+static int wait;
+
+void invd(void){
+    asm volatile ("invd");
+}
 
 void flush_all(void) {
     on_each_cpu((void (*)(void *)) __flush_tlb_all, NULL, 1);
-    on_each_cpu((void (*)(void *)) wbinvd, NULL, 1);
+    on_each_cpu((void (*)(void *)) invd, NULL, 1);
 }
 
 static pte_t *virt_to_pte(struct task_struct *task, unsigned long addr) {
@@ -91,10 +96,12 @@ asmlinkage vm_fault_t hooked_handle_pte_fault(struct vm_fault *vmf) {
             printk(KERN_INFO "[swap]: handle_pte_fault READ ip @ %llx, vmf->real_address @ %llx", task_pt_regs(current)->ip, vmf->real_address);
         }
 
+        local_irq_disable();
         set_pte(vmf->pte, pte_set_flags(*vmf->pte, _PAGE_PRESENT));
         flush_all();
 
         user_enable_single_step_(current);
+        local_irq_enable();
 
         return 0;
     }
@@ -106,14 +113,19 @@ asmlinkage vm_fault_t hooked_handle_pte_fault(struct vm_fault *vmf) {
 void hooked_arch_do_signal_or_restart(struct pt_regs *regs) {
     if (current == hooked_task) {
         // printk(KERN_INFO "[swap]: arch_do_signal_or_restart called on task @ %llx\n", hooked_task);
+        // printk(KERN_INFO "[swap]: current->ip @ %llx", task_pt_regs(current)->ip);
 
+        local_irq_disable();
         set_pte(hooked_ptep, pte_clear_flags(*hooked_ptep, _PAGE_PRESENT));
-        flush_all();
+        // flush_all();
 
         user_disable_single_step_(current);
+        local_irq_enable();
 
         sigdelset(&current->pending.signal, SIGTRAP);
         recalc_sigpending();
+
+        return;
     }
 
     return orig_arch_do_signal_or_restart(regs);
