@@ -18,7 +18,8 @@ int main(void) {
         printf("fun1(%i, %i): %i\n", a, b, fun1(a, b));
         printf("fun1 disas: ");
         for (int i = 0; i < (long) fun2 - (long) fun1; i++) {
-            printf("%hhx ", ((char *) fun1)[i]);
+            char c = ((char *) fun1)[i];
+            printf("%hhx ", c);
         }
         printf("\n");
         sleep(1);

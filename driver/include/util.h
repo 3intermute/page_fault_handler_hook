@@ -31,7 +31,7 @@
  * @brief invalidates cache on calling cpu
  */
 void pswap_invd(void){
-    asm volatile ("invd");
+    __asm__ __volatile__ ("invd");
 }
 
 /**
@@ -39,7 +39,7 @@ void pswap_invd(void){
  */
 void pswap_flush_all(void) {
     on_each_cpu((void (*)(void *)) __flush_tlb_all, NULL, 1);
-    on_each_cpu((void (*)(void *)) invd, NULL, 1);
+    on_each_cpu((void (*)(void *)) pswap_invd, NULL, 1);
 }
 
 /**

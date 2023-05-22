@@ -29,11 +29,14 @@
 #include <linux/kernel.h>
 #include <linux/ptrace.h>
 #include <linux/signal.h>
+#include <linux/mm.h>
+#include <linux/highmem.h>
 #include <linux/smp.h>
 #include <linux/sched/signal.h>
 #include <asm/traps.h>
 #include <asm/tlbflush.h>
 #include <asm/io.h>
+#include <asm/pgtable_types.h>
 
 #include "include/ftrace_helper.h"
 #include "include/resolve_ksyms.h"
@@ -44,24 +47,44 @@ MODULE_AUTHOR("wintermute");
 MODULE_DESCRIPTION("software watchpoints + physical page swapping on execute/read via page fault handler hooking");
 MODULE_VERSION("0.2");
 
+#define MAX_MARKED_RIPS 16
+
 struct pswap_context {
-    unsigned long user_virt_addr;
-    pte_t *pte;
+    unsigned long marked_virt_addr;
+    pte_t *ptep;
     struct vm_area_struct *vma;
 
-    unsigned long read_phys_addr;
-    unsigned long exec_phys_addr;
+    unsigned long read_virt_addr;
+    unsigned long exec_virt_addr;
+    pte_t read_pte;
+    pte_t exec_pte;
+
+    /**
+     * swap to read page but copy 15 bytes to read page, assumes ins is not reading within a 15 byte distance
+     */
+    unsigned long marked_rips[MAX_MARKED_RIPS];
 };
 
+int pswap_is_marked_rip(struct pswap_context *context, unsigned long addr) {
+    for (int i = 0; i < MAX_MARKED_RIPS; i++) {
+        if (addr == context->marked_rips[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 /**
  * replace this with with ioctls, currently only 1 page is hooked
  */
 static int pswap_param_pid;
-static ulong pswap_param_user_virt_addr;
+static ulong pswap_param_marked_virt_addr;
+static ulong pswap_param_marked_rip;
 
 module_param_named(pid, pswap_param_pid, int, 0644);
-module_param_named(page, pswap_param_user_virt_addr, ulong, 0644);
+module_param_named(addr, pswap_param_marked_virt_addr, ulong, 0644);
+module_param_named(rip, pswap_param_marked_rip, ulong, 0644);
+
 
 static struct task_struct *pswap_task;
 static struct pswap_context pswap_global_context;
@@ -81,18 +104,24 @@ asmlinkage vm_fault_t pswap_hooked_handle_pte_fault(struct vm_fault *vmf) {
     }
 
     pte_t *faulting_pte = pte_offset_map(vmf->pmd, vmf->address);
-    if (!(pswap_global_context.pte == faulting_pte)) {
-        goto orig:
+    if (!(pswap_global_context.ptep == faulting_pte)) {
+        goto orig;
     }
 
-    if (vmf->real_address == task_pt_regs(current)->ip) {
+    if (pswap_is_marked_rip(&pswap_global_context, task_pt_regs(current)->ip)) {
+        printk(KERN_DEBUG "handle_pte_fault READ hooked ip @ %llx, vmf->real_address @ %llx", task_pt_regs(current)->ip, vmf->real_address);
+        set_pte(pswap_global_context.ptep, pswap_global_context.read_pte);
+    }
+    else if (vmf->real_address == task_pt_regs(current)->ip) {
         printk(KERN_DEBUG "[pswap]: handle_pte_fault INS FETCH ip @ %llx, vmf->real_address @ %llx", task_pt_regs(current)->ip, vmf->real_address);
+        set_pte(pswap_global_context.ptep, pswap_global_context.exec_pte);
     }
     else {
         printk(KERN_DEBUG "[pswap]: handle_pte_fault READ ip @ %llx, vmf->real_address @ %llx", task_pt_regs(current)->ip, vmf->real_address);
+        set_pte(pswap_global_context.ptep, pswap_global_context.read_pte);
     }
 
-    set_pte(pswap_global_context.pte, pte_set_flags(*pswap_global_context.pte, _PAGE_PRESENT));
+    set_pte(pswap_global_context.ptep, pte_set_flags(*pswap_global_context.ptep, _PAGE_PRESENT));
     pswap_flush_all();
 
     pswap_user_enable_single_step(current);
@@ -114,7 +143,7 @@ void pswap_hooked_arch_do_signal_or_restart(struct pt_regs *regs) {
 
     // printk(KERN_DEBUG "[pswap]: arch_do_signal_or_restart called on task @ %llx\n", hooked_task);
 
-    set_pte(pswap_global_context.pte, pte_clear_flags(*pswap_global_context.pte, _PAGE_PRESENT));
+    set_pte(pswap_global_context.ptep, pte_clear_flags(*pswap_global_context.ptep, _PAGE_PRESENT));
     pswap_flush_all();
 
     pswap_user_disable_single_step(current);
@@ -142,16 +171,38 @@ static int __init pswap_driver_init(void) {
     pswap_task = pid_task(find_vpid(pswap_param_pid), PIDTYPE_PID);
     printk(KERN_DEBUG "[pswap]: hooked task with pid %i found @ %llx", pswap_param_pid, pswap_task);
 
+    pswap_global_context.marked_rips[0] = pswap_param_marked_rip;
+
     /**
      * currently only 1 page is hooked, this code is kind of unclean
      */
-    pswap_global_context.user_virt_addr = pswap_param_user_virt_addr;
-    pswap_global_context.pte = pswap_virt_to_pte(pswap_task, pswap_global_context.user_virt_addr);
-    pswap_global_context.vma = vma_lookup(pswap_task->mm, pswap_global_context.user_virt_addr);
+    pswap_global_context.marked_virt_addr = pswap_param_marked_virt_addr;
+    pswap_global_context.ptep = pswap_virt_to_pte(pswap_task, pswap_global_context.marked_virt_addr);
+    pswap_global_context.vma = vma_lookup(pswap_task->mm, pswap_global_context.marked_virt_addr);
 
-    printk(KERN_DEBUG "[pswap]: hooked ptep for addr %llx found @ %llx", pswap_global_context.user_virt_addr, pswap_global_context.pte);
+    printk(KERN_DEBUG "[pswap]: hooked ptep for addr %llx found @ %llx", pswap_global_context.marked_virt_addr, pswap_global_context.ptep);
 
-    set_pte(pswap_global_context.pte, pte_clear_flags(*pswap_global_context.pte, _PAGE_PRESENT));
+    struct page *p;
+    int locked;
+    get_user_pages_remote(pswap_task->mm, pswap_global_context.marked_virt_addr, 1, 0, &p, NULL, &locked);
+    pswap_global_context.exec_virt_addr = kmap(p);
+    pswap_global_context.exec_pte = *pswap_global_context.ptep;
+
+    pswap_global_context.read_virt_addr = kmalloc(PAGE_SIZE, GFP_USER);
+    pswap_global_context.read_pte = pfn_pte(virt_to_phys(pswap_global_context.read_virt_addr) >> PAGE_SHIFT, PAGE_SHARED_EXEC);
+
+    /*
+     * fun1: 555555555155
+     * base: 555555555000
+     */
+    memcpy(pswap_global_context.read_virt_addr, pswap_global_context.exec_virt_addr, PAGE_SIZE);
+    ((char *) pswap_global_context.read_virt_addr)[341] = 0xde;
+    ((char *) pswap_global_context.read_virt_addr)[342] = 0xad;
+    ((char *) pswap_global_context.read_virt_addr)[343] = 0xbe;
+    ((char *) pswap_global_context.read_virt_addr)[344] = 0xef;
+
+
+    set_pte(pswap_global_context.ptep, pte_clear_flags(*pswap_global_context.ptep, _PAGE_PRESENT));
     pswap_flush_all();
 
     int err;
@@ -166,7 +217,7 @@ static int __init pswap_driver_init(void) {
 static void __exit pswap_driver_exit(void) {
     fh_remove_hooks(pswap_hooks, ARRAY_SIZE(pswap_hooks));
 
-    set_pte(pswap_global_context.pte, pte_set_flags(*pswap_global_context.pte-, _PAGE_PRESENT));
+    set_pte(pswap_global_context.ptep, pte_set_flags(*pswap_global_context.ptep, _PAGE_PRESENT));
     pswap_flush_all();
 
     printk(KERN_DEBUG "[pswap]: module unloaded\n");
